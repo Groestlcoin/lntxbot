@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,11 +26,12 @@ type Settings struct {
 	RedisURL    string `envconfig:"REDIS_URL" required:"true"`
 	SocketPath  string `envconfig:"SOCKET_PATH" required:"true"`
 
-	InvoiceTimeout    time.Duration `envconfig:"INVOICE_TIMEOUT" default:"5h"`
+	InvoiceTimeout    time.Duration `envconfig:"INVOICE_TIMEOUT" default:"24h"`
 	PayConfirmTimeout time.Duration `envconfig:"PAY_CONFIRM_TIMEOUT" default:"5h"`
 	GiveAwayTimeout   time.Duration `envconfig:"GIVE_AWAY_TIMEOUT" default:"5h"`
 
-	Usage string
+	NodeId string
+	Usage  string
 }
 
 var err error
@@ -45,10 +47,14 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("couldn't process envconfig.")
 	}
-	s.Usage = renderUsage()
+
+	setupCommands()
 
 	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	log = log.With().Timestamp().Logger()
+
+	// seed the random generator
+	rand.Seed(time.Now().UnixNano())
 
 	// postgres connection
 	pg, err = sqlx.Connect("postgres", s.PostgresURL)
@@ -68,23 +74,42 @@ func main() {
 			Msg("failed to connect to redis")
 	}
 
-	// lightningd connection
-	lastinvoiceindex, _ := rds.Get("lastinvoiceindex").Int64()
-	ln = &lightning.Client{
-		Path:             s.SocketPath,
-		LastInvoiceIndex: int(lastinvoiceindex),
-		PaymentHandler:   handleInvoicePaid,
-	}
-	ln.ListenForInvoices()
-
-	// bot stuff
+	// create bot
 	bot, err = tgbotapi.NewBotAPI(s.BotToken)
 	if err != nil {
 		log.Fatal().Err(err).Msg("")
 	}
+	log.Info().Str("username", bot.Self.UserName).Msg("telegram bot authorized")
 
-	log.Printf("Authorized on account %s", bot.Self.UserName)
+	// lightningd connection
+	lastinvoiceindex, err := rds.Get("lastinvoiceindex").Int64()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to get lastinvoiceindex from redis")
+		return
+	}
+	if lastinvoiceindex < 10 {
+		res, err := ln.Call("listinvoices")
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to get lastinvoiceindex from listinvoices")
+			return
+		}
+		indexes := res.Get("invoices.#.pay_index").Array()
+		for _, indexr := range indexes {
+			index := indexr.Int()
+			if index > lastinvoiceindex {
+				lastinvoiceindex = index
+			}
+		}
+	}
 
+	ln = &lightning.Client{
+		Path:             s.SocketPath,
+		LastInvoiceIndex: int(lastinvoiceindex),
+		PaymentHandler:   invoicePaidListener,
+	}
+	ln.ListenForInvoices()
+
+	// bot stuff
 	_, err = bot.SetWebhook(tgbotapi.NewWebhook(s.ServiceURL + "/" + bot.Token))
 	if err != nil {
 		log.Fatal().Err(err).Msg("")
@@ -94,7 +119,7 @@ func main() {
 		log.Fatal().Err(err).Msg("")
 	}
 	if info.LastErrorDate != 0 {
-		log.Printf("Telegram callback failed: %s", info.LastErrorMessage)
+		log.Debug().Str("err", info.LastErrorMessage).Msg("telegram callback failed")
 	}
 	updates := bot.ListenForWebhook("/" + bot.Token)
 
@@ -112,20 +137,22 @@ func main() {
 	go http.ListenAndServe("0.0.0.0:"+s.Port, nil)
 
 	// pause here until lightningd works
-	probeLightningd()
+	s.NodeId = probeLightningd()
+
+	// dispatch kick job for pending users
+	startKicking()
 
 	for update := range updates {
 		handle(update)
 	}
 }
 
-func probeLightningd() {
+func probeLightningd() string {
 	nodeinfo, err := ln.Call("getinfo")
 	if err != nil {
 		log.Warn().Err(err).Msg("can't talk to lightningd. retrying.")
 		time.Sleep(time.Second * 5)
-		probeLightningd()
-		return
+		return probeLightningd()
 	}
 	log.Info().
 		Str("id", nodeinfo.Get("id").String()).
@@ -134,4 +161,6 @@ func probeLightningd() {
 		Int64("blockheight", nodeinfo.Get("blockheight").Int()).
 		Str("version", nodeinfo.Get("version").String()).
 		Msg("lightning node connected")
+
+	return nodeinfo.Get("id").String()
 }
